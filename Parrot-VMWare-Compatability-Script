@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKDIR="$HOME/Desktop/vmware-manual-fix"
+KVER="$(uname -r)"
+MODDIR="/lib/modules/$KVER/kernel/drivers/misc"
+SRC="/usr/lib/vmware/modules/source"
+
+echo "[*] Kernel: $KVER"
+echo "[*] Workdir: $WORKDIR"
+
+if [[ $EUID -eq 0 ]]; then
+  echo "Run this as your normal user, not root."
+  exit 1
+fi
+
+command -v make >/dev/null || { echo "Missing make/build tools"; exit 1; }
+command -v gcc >/dev/null || { echo "Missing gcc"; exit 1; }
+
+if [[ ! -d "/lib/modules/$KVER/build" ]]; then
+  echo "Missing kernel headers for $KVER"
+  echo "Install with: sudo apt install linux-headers-\$(uname -r)"
+  exit 1
+fi
+
+if [[ ! -f "$SRC/vmmon.tar" || ! -f "$SRC/vmnet.tar" ]]; then
+  echo "Missing VMware source tarballs in $SRC"
+  exit 1
+fi
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+cp "$SRC/vmmon.tar" .
+cp "$SRC/vmnet.tar" .
+
+tar xf vmmon.tar
+tar xf vmnet.tar
+
+echo "[*] Patching vmmon..."
+cd "$WORKDIR/vmmon-only"
+
+cat >> Makefile <<'EOF'
+
+# Manual include-path fix for newer kernels
+EXTRA_CFLAGS += -I$(PWD)
+EXTRA_CFLAGS += -I$(PWD)/include
+EXTRA_CFLAGS += -I$(PWD)/common
+EXTRA_CFLAGS += -I$(PWD)/linux
+EXTRA_CFLAGS += -I$(PWD)/include/x86
+EXTRA_CFLAGS += -I$(PWD)/include/x86_64
+ccflags-y += -I$(PWD)
+ccflags-y += -I$(PWD)/include
+ccflags-y += -I$(PWD)/common
+ccflags-y += -I$(PWD)/linux
+ccflags-y += -I$(PWD)/include/x86
+ccflags-y += -I$(PWD)/include/x86_64
+ccflags-y += -Wno-error=implicit-function-declaration
+EXTRA_CFLAGS += -Wno-error=implicit-function-declaration
+EOF
+
+sed -i 's/#include "vmcore_types.h"/\/\/ #include "vmcore_types.h" removed/' include/x86svm.h
+sed -i 's/#include "cpuidInfo.h"/\/\/ #include "cpuidInfo.h" removed/' include/x86svm.h
+
+grep -q 'typedef int AccessMode;' include/x86svm.h || sed -i '/#define _X86SVM_H_/a \
+typedef int AccessMode;\
+#define ACCESS_MODE_READ 0\
+#define ACCESS_MODE_WRITE 1\
+typedef struct CpuidInfo CpuidInfo;\
+' include/x86svm.h
+
+python3 - <<'PY'
+from pathlib import Path
+p = Path("include/x86svm.h")
+s = p.read_text()
+start = s.find("static inline Bool\nSVM_SupportedRev")
+end = s.find("#endif /* VMMON */", start)
+if start != -1 and end != -1:
+    replacement = '''static inline Bool
+SVM_SupportedRev(const CpuidInfo *cpuid)
+{
+   return FALSE;
+}
+
+static inline Bool
+SVM_SupportedCPU(const CpuidInfo *cpuid)
+{
+   return FALSE;
+}
+
+'''
+    s = s[:start] + replacement + s[end:]
+    p.write_text(s)
+PY
+
+grep -q '<linux/timer.h>' linux/driver.c || sed -i '/#include <linux\/wait.h>/a #include <linux/timer.h>' linux/driver.c
+grep -q '<linux/timer.h>' linux/hostif.c || sed -i '/#include <linux\/wait.h>/a #include <linux/timer.h>' linux/hostif.c
+grep -q '<asm/msr.h>' linux/hostif.c || sed -i '/#include <asm\/io.h>/a #include <asm/msr.h>' linux/hostif.c
+
+sed -i 's/rdmsrl_safe/rdmsrq_safe/g' linux/hostif.c
+sed -i 's/del_timer_sync/timer_delete_sync/g' linux/driver.c linux/hostif.c
+
+sed -i 's/#error MonLoader cannot be built as part of this environment/\/\/ #error disabled for kernel 6.17 manual build/' bootstrap/monLoader.c
+sed -i 's/#error MonLoader cannot be built as part of this environment/\/\/ #error disabled for kernel 6.17 manual build/' include/monLoaderLog.h
+
+grep -q '<linux/limits.h>' bootstrap/monLoader.c || sed -i '/#include "monLoaderLog.h"/a #include <linux/limits.h>\n#include <linux/string.h>' bootstrap/monLoader.c
+grep -q '#define LOG(level, fmt' bootstrap/monLoader.c || sed -i '/#include "monLoaderLog.h"/a #ifndef LOG\n#define LOG(level, fmt, ...) do { } while (0)\n#endif' bootstrap/monLoader.c
+grep -q '#define LOG(level, fmt' bootstrap/monLoaderVmmon.c || sed -i '/#include "monLoaderLog.h"/a #ifndef LOG\n#define LOG(level, fmt, ...) do { } while (0)\n#endif' bootstrap/monLoaderVmmon.c
+
+make clean
+make VM_UNAME="$KVER"
+
+echo "[*] Installing vmmon..."
+sudo mkdir -p "$MODDIR"
+sudo cp vmmon.ko "$MODDIR/"
+sudo depmod -a
+sudo modprobe vmmon
+
+echo "[*] Patching vmnet..."
+cd "$WORKDIR/vmnet-only"
+
+cat >> Makefile <<'EOF'
+
+# Manual include-path fix for newer kernels
+EXTRA_CFLAGS += -I$(PWD)
+EXTRA_CFLAGS += -I$(PWD)/include
+EXTRA_CFLAGS += -I$(PWD)/common
+EXTRA_CFLAGS += -I$(PWD)/linux
+ccflags-y += -I$(PWD)
+ccflags-y += -I$(PWD)/include
+ccflags-y += -I$(PWD)/common
+ccflags-y += -I$(PWD)/linux
+ccflags-y += -Wno-error=implicit-function-declaration
+EXTRA_CFLAGS += -Wno-error=implicit-function-declaration
+EOF
+
+cp driver.c driver.c.pre-k617-fix
+
+sed -i 's/^int$/static int __init/' driver.c
+sed -i 's/^init_module/vmnet_init/' driver.c
+sed -i 's/^void$/static void __exit/' driver.c
+sed -i 's/^cleanup_module/vmnet_exit/' driver.c
+
+grep -q 'module_init(vmnet_init);' driver.c || cat >> driver.c <<'EOF'
+
+module_init(vmnet_init);
+module_exit(vmnet_exit);
+EOF
+
+make clean
+make VM_UNAME="$KVER"
+
+echo "[*] Installing vmnet..."
+sudo cp vmnet.ko "$MODDIR/"
+sudo depmod -a
+sudo modprobe vmnet
+
+echo "[*] Fixing /dev/vmmon permissions..."
+echo 'KERNEL=="vmmon", MODE="0666"' | sudo tee /etc/udev/rules.d/99-vmware-vmmon.rules >/dev/null
+sudo udevadm control --reload-rules || true
+sudo chmod 666 /dev/vmmon || true
+
+echo "[*] Status:"
+lsmod | grep -E 'vmmon|vmnet' || true
+ls -l /dev/vmmon || true
+
+echo "[+] Done. Try: vmplayer"
